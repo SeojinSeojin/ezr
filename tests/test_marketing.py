@@ -67,6 +67,20 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(report, m.explain(model, row[:-1]+['?']))
         self.assertTrue({e['source_row'] for e in evidence} <= {r[0] for r in train})
 
+    def test_explain_selects_recommendation_without_test_labels(self):
+        rows = fixture()
+        recommendation = m.predict(rows)['recommended_source_rows'][0]
+        report = m.explain_holdout(rows)
+        self.assertEqual(report['source_row'], recommendation)
+        train, test = m.split(rows)
+        test_ids = {r[0] for r in test}
+        changed = [r[:-1]+[1-r[-1]] if r[0] in test_ids else r[:] for r in rows]
+        self.assertEqual(report, m.explain_holdout(changed))
+        selected = m.explain_holdout(rows, source_row=test[0][0])
+        self.assertEqual(selected['source_row'], test[0][0])
+        with self.assertRaisesRegex(ValueError, 'not in the held-out'):
+            m.explain_holdout(rows, source_row=train[0][0])
+
     def test_invalid_values(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d)/'data.csv'

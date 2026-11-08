@@ -193,9 +193,96 @@ def explain(model, row):
                             'calibrated probability.')
 
 
-def explain_holdout(rows, seed=591):
+def explain_holdout(rows, seed=591, source_row=None):
     train, test = split(rows, seed)
-    return explain(Predictor(train), min(test, key=lambda r: r[0]))
+    model = Predictor(train)
+    if source_row is None:
+        # Same ranking as predict; selection never consults test responses.
+        row = min(test, key=lambda r: (-model.score(r), r[0]))
+    else:
+        row = next((r for r in test if r[0] == source_row), None)
+        if row is None:
+            raise ValueError(f'CSV row {source_row} is not in the held-out test set for seed {seed}')
+    result = explain(model, row)
+    result['selection'] = ('Highest-ranked held-out customer (ties use CSV row number).'
+                           if source_row is None else 'Held-out customer selected with --row.')
+    return result
+
+
+def readable(command, result):
+    """Present the same calculations in customer-facing language."""
+    def number(value):
+        return 'unknown' if value in (None, '?') else f'{value:,.1f}'
+
+    if command == 'summarize':
+        means = result['means']
+        lines = ['CUSTOMER OVERVIEW',
+                 f"Customers: {result['rows']:,}",
+                 f"Responded to the observed campaign: {result['response_prevalence']:.1%}",
+                 '', 'Typical customer (averages across known values):']
+        for key, label in [('INCOME', 'Income'), ('AGE', 'Age (years)'),
+                           ('RECENCY', 'Days since last purchase'),
+                           ('MNTWINES', 'Wine spending'), ('MNTTOTAL', 'Total spending'),
+                           ('NUMSTOREPURCHASES', 'Store purchases'),
+                           ('NUMWEBPURCHASES', 'Web purchases'),
+                           ('NUMCATALOGPURCHASES', 'Catalog purchases')]:
+            lines.append(f'  {label}: {number(means[key])}')
+        missing = {k: v for k, v in result['missing'].items() if v}
+        lines += ['', 'Missing values: '+(', '.join(f'{k}: {v}' for k, v in missing.items())
+                                         if missing else 'none in selected columns.'),
+                  f"Prediction uses {len(result['inputs'])} customer features; only campaign response is the target.",
+                  'Spending and income use the original dataset units.']
+    elif command == 'groups':
+        lines = ['CUSTOMER GROUPS',
+                 'Each row describes the average customer in one similarity group.', '',
+                 f"{'Group':<7}{'Customers':>10}{'Income':>13}{'Wine spend':>13}{'Days inactive':>15}"]
+        for group in result:
+            profile = group['profile']
+            lines.append(f"{group['group']:<7}{group['rows']:>10,}"
+                         f"{number(profile['INCOME']):>13}"
+                         f"{number(profile['MNTWINES']):>13}"
+                         f"{number(profile['RECENCY']):>15}")
+        lines += ['', 'Compare income, wine spending and time since purchase to plan different messages.',
+                  'Groups use customer features only; campaign responses do not determine membership.',
+                  'These are descriptive groups, not proven marketing segments. Amounts use dataset units.']
+    elif command == 'predict':
+        n = result['contacts']
+        responders = round(result['precision_at_budget'] * n)
+        expected = result['random_contact_expected_precision'] * n
+        lines = ['CAMPAIGN CONTACT DEMO',
+                 f"Learned from {result['train_size']:,} customers; evaluated on {result['test_size']:,} held-out customers (seed {result['seed']}).",
+                 '', f'If we contact the {n} highest-ranked test customers:',
+                 f"  {responders} of {n} actually responded in the recorded campaign ({result['precision_at_budget']:.1%} precision).",
+                 f'  Randomly contacting {n} test customers would find {expected:.1f} responders on average '
+                 f"({result['random_contact_expected_precision']:.1%}).",
+                 f"  Across the full dataset, {result['overall_response_prevalence']:.1%} responded.",
+                 '', 'Random baseline = the exact expected result of uniform sampling without replacement;',
+                 'it equals the response rate in the held-out test set.',
+                 '', 'Recommended CSV row numbers, in ranked order:',
+                 '\n'.join('  '+', '.join(map(str, result['recommended_source_rows'][i:i+10]))
+                           for i in range(0, len(result['recommended_source_rows']), 10)),
+                 'Row numbers locate records in the original CSV; they are not customer IDs.',
+                 '', 'This is a historical demonstration, not a guarantee of future results or certified superiority.']
+    else:
+        evidence = result['similar_training_customers']
+        yes = sum(e['observed_response'] for e in evidence)
+        lines = [f"WHY THIS SCORE? — CSV row {result['source_row']}",
+                 result.get('selection', 'Held-out customer.'),
+                 f"Neighbor response score: {int(yes)}/{len(evidence)} = {result['predicted_response_score']:.1%}",
+                 f'{int(yes)} of the {len(evidence)} most similar training customers responded.',
+                 'This is a vote from similar past customers, not this customer’s chance of responding.',
+                 'With five neighbors, scores change in 20-percentage-point steps.',
+                 'Even 0% or 100% is not a guarantee.', '',
+                 f"{'CSV row':<10}{'Distance':>10}{'Income':>13}{'Wine spend':>13}  Campaign response"]
+        for e in evidence:
+            lines.append(f"{e['source_row']:<10}{e['distance']:>10.3f}"
+                         f"{number(e['income']):>13}{number(e['wine_spend']):>13}  "
+                         + ('Responded' if e['observed_response'] else 'Did not respond'))
+        lines += ['', 'Smaller distance means more similar across all customer input features.',
+                  'Income and wine spending are shown as examples; they are not the only inputs.',
+                  'The held-out customer’s own response was not used to explain or calculate this score.',
+                  'This shows the evidence behind the score, not a causal reason to contact someone.']
+    return '\n'.join(lines)
 
 
 def main():
@@ -203,15 +290,19 @@ def main():
     parser.add_argument('command', choices=['summarize', 'groups', 'predict', 'explain'])
     parser.add_argument('--data', type=Path, default=data_path())
     parser.add_argument('--seed', type=int, default=591)
+    parser.add_argument('--row', type=int, help='explain a specific held-out CSV row (default: highest-ranked)')
+    parser.add_argument('--json', action='store_true', help='print full structured output instead of the readable report')
     args = parser.parse_args()
+    if args.row is not None and args.command != 'explain':
+        parser.error('--row is only available for explain')
     try:
         rows = load(args.data)
-        result = (explain_holdout(rows, args.seed) if args.command == 'explain' else
+        result = (explain_holdout(rows, args.seed, args.row) if args.command == 'explain' else
                   predict(rows, args.seed) if args.command == 'predict' else
                   summarize(rows) if args.command == 'summarize' else groups(rows))
     except ValueError as exc:
         parser.error(str(exc))
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2) if args.json else readable(args.command, result))
 
 
 if __name__ == '__main__':

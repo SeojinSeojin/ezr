@@ -44,7 +44,8 @@ replacement of that same size from the test set: test response prevalence. There
 are no random-baseline draws or uncertainty estimates. Overall prevalence is also
 reported, separately. With fewer than 50 test rows all are selected.
 
-Explain uses the lowest-source-line held-out customer, blanks their true response,
+Explain uses the highest-scored held-out customer (ties use source line), or a held-out
+customer selected with --row. Selection does not consult test outcomes. It blanks their true response,
 and returns the actual neighbors, distances, observed training labels and their
 mean. It does not reveal the held-out outcome. Scores are not calibrated probabilities
 or causal explanations. The full-data groups and summary are not training transforms.
